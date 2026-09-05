@@ -435,9 +435,48 @@ class Mouth:
             except Exception:
                 log("[mouth] the output stream went away, reopening")
         self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        try:
+            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+            self._out.start()
+        except Exception:
+            # A stale PortAudio device list can strand the OUTPUT side the
+            # same way ears._reopen_after_device_change fixes the INPUT
+            # side -- but that rebuild only ever runs when a mic capture
+            # triggers it. If speech is the first thing to hit the stale
+            # list (no capture in between), nothing ever calls it, so
+            # mirror that same rebuild here before giving up.
+            #
+            # One rebuild attempt used to be it -- but the real-world
+            # trigger (a Bluetooth headset dropping and re-pairing) isn't
+            # instantaneous: the device can still be mid-handshake for a
+            # few hundred ms after Windows already reports it gone, so a
+            # single immediate retry could still lose the race. Found
+            # 2026-09-05 after this stranded the voice across FOUR
+            # separate incidents in one day, each only fixed by a full
+            # backtalk restart. Retry a few times with a short backoff
+            # before actually giving up.
+            import time
+            last_err = None
+            for attempt in range(1, 4):
+                log(f"[mouth] output open failed, rebuilding audio "
+                    f"devices (attempt {attempt}/3)")
+                try:
+                    sd._terminate()
+                except Exception:
+                    pass
+                sd._initialize()
+                try:
+                    self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                                 dtype="int16")
+                    self._out.start()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.4 * attempt)
+            if last_err is not None:
+                raise last_err
         self._out_rate = rate
-        self._out.start()
         return self._out
 
     def _cut(self):

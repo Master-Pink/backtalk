@@ -51,6 +51,57 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
+# --- usage-limit / dead-turn detection -------------------------------
+# When the plan hits its ceiling mid-turn the model call stops without a
+# real answer, and depending on the SDK build that surfaces as a lone
+# complete AssistantMessage ("Claude AI usage limit reached|<ts>"), a
+# ResultMessage flagged is_error, a raised exception, or the response
+# stream simply exhausting with nothing in it. Left unspoken it looks
+# exactly like a hang: the face sticks on "thinking" and every later
+# message drains as "0 stale messages". So name it out loud instead.
+_LIMIT_MARKERS = (
+    "usage limit reached",
+    "claude ai usage limit",
+    "rate limit exceeded",
+    "rate_limit_error",
+    "resets_at",
+    "quota exceeded",
+    "credit balance is too low",
+    "insufficient credit",
+    "overloaded_error",
+)
+
+
+def _looks_like_limit(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _LIMIT_MARKERS)
+
+
+def _reset_clause(text: str) -> str:
+    """" It should reset around 3:00 PM." when the CLI handed back a
+    reset time — it appends "|<unix ts>" to a usage-limit message, and
+    the API error spells it resets_at. Empty string when there's none."""
+    m = re.search(r"\|\s*(\d{9,13})\b", text or "")
+    if not m:
+        m = re.search(r"resets?_?at['\"]?\s*[:=]\s*['\"]?(\d{9,13})",
+                      (text or "").lower())
+    if not m:
+        return ""
+    try:
+        ts = int(m.group(1))
+        if ts > 1_000_000_000_000:          # milliseconds -> seconds
+            ts //= 1000
+        when = datetime.fromtimestamp(ts).strftime("%I:%M %p").lstrip("0")
+        return f" It should reset around {when}."
+    except Exception:
+        return ""
+
+
+def _limit_sentence(text: str = "") -> str:
+    return ("I've hit the Claude usage limit, so I can't answer until "
+            "the plan resets." + _reset_clause(text))
+
+
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
                  resume_id: str | None = None):
@@ -75,6 +126,11 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # Set when the last ask_stream turn came back with no real answer
+        # (usage limit, error result, empty stream). Cleared at the start
+        # of every turn. The startup warmup checks it so an out-of-usage
+        # launch still fails loudly instead of booting "warm".
+        self._last_turn_failed = False
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -311,45 +367,103 @@ class WarmBrain:
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
         self._dirty = True             # in flight until its ResultMessage
+        self._last_turn_failed = False
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
-                elif ev.get("type") == "content_block_stop":
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
-                        yield tail
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                await self._pull_rate_limits()
-                break
+        yielded = False                # any real answer text went out
+        saw_result = False             # the turn reached its ResultMessage
+        try:
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            # emit any complete sentences
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yielded = True
+                                    yield sentence
+                    elif ev.get("type") == "content_block_stop":
+                        # End of a speech block (e.g. right before a tool
+                        # call): flush NOW. Without this, pre-tool filler
+                        # ("On it — let me grab that.") sits silent in the
+                        # buffer through the whole tool run, then plays
+                        # glued to the answer: long dead air, then two
+                        # thoughts at once.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yielded = True
+                            yield tail
+                elif t == "AssistantMessage" and not yielded and not buf:
+                    # A usage-limit stop can arrive as ONE complete
+                    # assistant message with no stream deltas at all —
+                    # the StreamEvent branch never sees it. Only trust it
+                    # when nothing has streamed this turn.
+                    whole = " ".join(
+                        getattr(b, "text", "") or ""
+                        for b in getattr(msg, "content", []) or []).strip()
+                    if _looks_like_limit(whole):
+                        log(f"[brain] usage limit reached (assistant "
+                            f"message): {whole[:160]}")
+                        self._last_turn_failed = True
+                        yielded = True
+                        yield _limit_sentence(whole)
+                elif t == "ResultMessage":
+                    saw_result = True
+                    self._dirty = False   # turn consumed — pipe aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    await self._pull_rate_limits()
+                    if not yielded:
+                        detail = str(getattr(msg, "result", "")
+                                     or getattr(msg, "subtype", "") or "")
+                        if _looks_like_limit(detail):
+                            log(f"[brain] turn ended at usage limit: "
+                                f"{detail[:160]}")
+                            self._last_turn_failed = True
+                            yielded = True
+                            yield _limit_sentence(detail)
+                        elif getattr(msg, "is_error", False):
+                            log(f"[brain] turn ended with an error: "
+                                f"{detail[:160]}")
+                            self._last_turn_failed = True
+                            yielded = True
+                            yield ("That turn ended with an error before "
+                                   "I could get you an answer. Check "
+                                   "this window for the details.")
+                    break
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as e:
+            if _looks_like_limit(repr(e)):
+                log(f"[brain] usage limit reached: {str(e)[:200]}")
+                self._last_turn_failed = True
+                yield _limit_sentence(repr(e))
+                return
+            raise
         tail = buf.strip()
         if tail:
             yield tail
+        elif not yielded and not saw_result:
+            # The response stream exhausted with no ResultMessage and no
+            # text — the exact silent spin that reads as a hang and then
+            # drains as "0 stale messages" every turn after. Usually the
+            # plan hit its ceiling mid-turn.
+            log("[brain] turn produced no response and no result "
+                "message — likely usage limit")
+            self._last_turn_failed = True
+            yield ("That turn came back completely empty. I've most "
+                   "likely hit the Claude usage limit — check this "
+                   "window.")
 
 
 if __name__ == "__main__":

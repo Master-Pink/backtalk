@@ -53,13 +53,19 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import http.server
 import json
 import queue
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
 from backtalk import signals
 from backtalk.brain import WarmBrain
@@ -72,6 +78,196 @@ from backtalk.vlog import log
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
+
+# ---- TELEGRAM LIVE BRIDGE (optional, second dedicated bot — never
+# @PinkCharlieBot; see the vault note for why). Lets this exact
+# conversation swap seamlessly to Telegram texting: a webhook receiver
+# below accepts inbound pushes as first-class turns (same pipeline as
+# typed input, wired into amain()'s waiters), and every spoken reply
+# plus every local utterance gets mirrored out, so the Telegram thread
+# reads as one continuous transcript no matter where a message
+# originated. Both directions are no-ops unless
+# TELEGRAM_LIVEBRIDGE_BOT_TOKEN / _CHAT_ID are present in
+# agent_dir/.secrets/telegram.env — never hardcoded, never logged.
+def _load_tg_bridge_secrets():
+    path = Path(CFG["agent_dir"]) / ".secrets" / "telegram.env"
+    out = {}
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+_TG_SECRETS = _load_tg_bridge_secrets()
+_TG_BRIDGE = {
+    "token": _TG_SECRETS.get("TELEGRAM_LIVEBRIDGE_BOT_TOKEN", ""),
+    "chat_id": _TG_SECRETS.get("TELEGRAM_LIVEBRIDGE_CHAT_ID", ""),
+}
+_TG_WEBHOOK_PORT = 8793
+
+
+def _tg_send(text: str):
+    """Blocking POST to Telegram's sendMessage. Call via _tg_send_async
+    from the voice loop or a coroutine — this one can stall on the
+    network and must never be awaited or called inline there."""
+    if not (_TG_BRIDGE["token"] and _TG_BRIDGE["chat_id"]):
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "chat_id": _TG_BRIDGE["chat_id"],
+            "text": text[:4096],
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot" + _TG_BRIDGE["token"]
+            + "/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log(f"[tgbridge] send failed: {e!r}")
+
+
+def _tg_send_async(text: str):
+    """Fire-and-forget mirror: a slow or down Telegram must never cost
+    the voice loop a single millisecond of latency."""
+    if _TG_BRIDGE["token"] and _TG_BRIDGE["chat_id"]:
+        threading.Thread(target=_tg_send, args=(text,), daemon=True).start()
+
+
+class _TGWebhookHandler(http.server.BaseHTTPRequestHandler):
+    """Receives Telegram's webhook push for the live-bridge bot. Only a
+    message from the configured chat id is ever actioned — the Bot API
+    stamps chat.id itself, so this can't be spoofed by a stranger who
+    finds the bot's username."""
+
+    def log_message(self, *a):
+        pass  # backtalk's own log is the log; no bare HTTP access noise
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        self.send_response(200)   # Telegram only needs a 200, always
+        self.end_headers()
+        try:
+            update = json.loads(body or b"{}")
+            msg = update.get("message") or {}
+            text = msg.get("text")
+            chat_id = str((msg.get("chat") or {}).get("id", ""))
+            if text and chat_id and chat_id == _TG_BRIDGE["chat_id"]:
+                self.server.tg_q.put(text)
+        except Exception as e:
+            log(f"[tgbridge] webhook parse failed: {e!r}")
+
+
+def _start_tg_webhook(tg_q: "queue.Queue[str]"):
+    """Background listener for Telegram's webhook pushes. No-ops if the
+    live-bridge secrets aren't configured; a bind failure is logged, not
+    raised — the voice session must come up either way."""
+    if not (_TG_BRIDGE["token"] and _TG_BRIDGE["chat_id"]):
+        log("[tgbridge] TELEGRAM_LIVEBRIDGE_* not set — live bridge disabled")
+        return
+    try:
+        server = http.server.HTTPServer(
+            ("127.0.0.1", _TG_WEBHOOK_PORT), _TGWebhookHandler)
+    except OSError as e:
+        log(f"[tgbridge] couldn't bind webhook port {_TG_WEBHOOK_PORT}: {e!r}")
+        return
+    server.tg_q = tg_q
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"[tgbridge] webhook listener up on 127.0.0.1:{_TG_WEBHOOK_PORT}")
+
+
+def _tg_ensure_ngrok():
+    """Make sure ngrok's local admin API answers before registration
+    tries to use it. Backtalk owns this now instead of assuming a
+    human started ngrok by hand — that gap (ngrok quietly not running)
+    is what broke the live bridge on 2026-09-04: registration failed
+    silently and nobody noticed until an inbound test came back dead.
+    Launches ngrok detached so it keeps running independently of this
+    backtalk process, same as it was already doing before. Never
+    raises; a launch failure just means the registration call below
+    logs its own failure as it always has."""
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:4040/api/tunnels", timeout=2):
+            return True
+    except Exception:
+        pass
+    ngrok_bin = shutil.which("ngrok")
+    if not ngrok_bin:
+        log("[tgbridge] ngrok not on PATH — can't auto-start it")
+        return False
+    try:
+        subprocess.Popen(
+            [ngrok_bin, "http", str(_TG_WEBHOOK_PORT)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP)
+        log("[tgbridge] ngrok wasn't running — launched it")
+    except Exception as e:
+        log(f"[tgbridge] failed to launch ngrok: {e!r}")
+        return False
+    for _ in range(8):
+        time.sleep(1)
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:4040/api/tunnels", timeout=2):
+                return True
+        except Exception:
+            continue
+    log("[tgbridge] ngrok didn't come up within 8s of launching it")
+    return False
+
+
+def _tg_register_webhook():
+    """Best-effort, once per launch, off the event loop: make sure
+    ngrok is actually up (auto-launching it if it isn't), read its
+    local admin API for the current public tunnel to the webhook port,
+    and register it with Telegram's setWebhook. No reserved ngrok
+    domain is in use (paid-plan only), so the public URL changes on
+    every ngrok restart — this call is what makes that self-healing on
+    the next backtalk launch instead of silently going stale. Retries
+    a few times so a transient hiccup doesn't wait for the next
+    restart to heal. Never raises; a missing ngrok binary or a
+    persistent network problem just leaves inbound Telegram
+    unavailable until the next successful launch, logged clearly."""
+    if not (_TG_BRIDGE["token"] and _TG_BRIDGE["chat_id"]):
+        return
+    _tg_ensure_ngrok()
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:4040/api/tunnels", timeout=5) as r:
+                tunnels = json.loads(r.read()).get("tunnels", [])
+            public_url = next(
+                (t["public_url"] for t in tunnels
+                 if t.get("proto") == "https"
+                 and str(t.get("config", {}).get("addr", ""))
+                     .endswith(str(_TG_WEBHOOK_PORT))),
+                None)
+            if not public_url:
+                log("[tgbridge] ngrok not detected on port "
+                    f"{_TG_WEBHOOK_PORT} — inbound Telegram won't work "
+                    "until it's running and backtalk restarts")
+                return
+            data = urllib.parse.urlencode({"url": public_url}).encode()
+            req = urllib.request.Request(
+                "https://api.telegram.org/bot" + _TG_BRIDGE["token"]
+                + "/setWebhook", data=data)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                ok = json.loads(r.read()).get("ok")
+            log(f"[tgbridge] webhook registered at {public_url}" if ok
+                else "[tgbridge] setWebhook call did not confirm ok")
+            return
+        except Exception as e:
+            if attempt == 2:
+                log(f"[tgbridge] webhook registration failed: {e!r}")
+            else:
+                time.sleep(2)
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -605,6 +801,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
+        _tg_send_async(s)   # mirror every spoken chunk to the live bridge
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
@@ -694,6 +891,13 @@ async def amain():
             async for _ in brain.ask_stream(
                     "Warmup ping - reply with the single word: ready"):
                 pass
+            # ask_stream now speaks its own "out of usage" line rather
+            # than raising, so a limited launch would otherwise sail
+            # past this and report "brain warm". Turn it back into a
+            # loud startup failure.
+            if getattr(brain, "_last_turn_failed", False):
+                raise RuntimeError("warmup turn returned no answer — "
+                                   "brain unreachable or plan out of usage")
         await asyncio.wait_for(_warmup(), 180)
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
@@ -722,6 +926,10 @@ async def amain():
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
+    tg_q: "queue.Queue[str]" = queue.Queue()
+    _start_tg_webhook(tg_q)
+    threading.Thread(target=_tg_register_webhook, daemon=True).start()
+    tg_fut: asyncio.Future | None = None
 
     async def run_console(verb):
         """One voice-console verb. The current reply was already
@@ -856,12 +1064,17 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     from_telegram: bool = False) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        from_telegram marks a turn that arrived via the live bridge, so
+        it isn't mirrored right back to the chat it just came from."""
         nonlocal speak_task
         log(f"[you]    {text}")
+        if not from_telegram:
+            _tg_send_async(f"(you): {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
         # began earlier is the user interrupting the turn, not
@@ -965,9 +1178,11 @@ async def amain():
                     mic_fut.result(); mic_fut = None
             if typed_fut is None:
                 typed_fut = loop.run_in_executor(None, typed_q.get)
+            if tg_fut is None:
+                tg_fut = loop.run_in_executor(None, tg_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
-            waiters = {press_fut, typed_fut}
+            waiters = {press_fut, typed_fut, tg_fut}
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -981,6 +1196,11 @@ async def amain():
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):
+                    return
+                continue
+            if tg_fut in done:
+                text = tg_fut.result(); tg_fut = None
+                if text and not await handle(text, from_telegram=True):
                     return
                 continue
             if mic_fut is not None and mic_fut in done:
@@ -1106,7 +1326,14 @@ def main():
               "talk key, which looks exactly like the talk key being "
               "broken. Use the window that is already open, or close it "
               "and start again.", flush=True)
-        sys.exit(1)
+        # Exit 0, not 1: this is an expected, graceful no-op, not a crash.
+        # Start Backtalk.bat's `if errorlevel 1 pause` exists so a REAL
+        # crash stays readable instead of the window vanishing - it should
+        # not also catch this case, or every launch while a voice line is
+        # already running (e.g. the desktop console's own exe now
+        # auto-starting one) leaves a minimized "press any key" window
+        # behind that nobody ever sees to dismiss.
+        sys.exit(0)
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
