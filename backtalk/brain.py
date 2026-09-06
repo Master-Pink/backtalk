@@ -64,17 +64,31 @@ _LIMIT_MARKERS = (
     "claude ai usage limit",
     "rate limit exceeded",
     "rate_limit_error",
-    "resets_at",
     "quota exceeded",
     "credit balance is too low",
     "insufficient credit",
-    "overloaded_error",
 )
+# A transient server condition, NOT the plan's ceiling — it clears on its
+# own in seconds. Kept OUT of _LIMIT_MARKERS so it stops being announced
+# as "you've hit the usage limit". "resets_at" came out of the markers
+# too: it's a field name in the healthy get_usage telemetry JSON, not a
+# limit signal, and _reset_clause has its own regex for a real reset time.
+_OVERLOAD_MARKERS = ("overloaded_error", "overloaded")
 
 
 def _looks_like_limit(text: str) -> bool:
     t = (text or "").lower()
     return any(m in t for m in _LIMIT_MARKERS)
+
+
+def _looks_like_overload(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _OVERLOAD_MARKERS)
+
+
+def _overload_sentence() -> str:
+    return ("Anthropic's servers are briefly overloaded — that's not a "
+            "usage limit. Give it a few seconds and ask again.")
 
 
 def _reset_clause(text: str) -> str:
@@ -310,6 +324,18 @@ class WarmBrain:
         if self._client:
             await self._client.interrupt()
 
+    async def _rebuild(self):
+        """Drop a wedged client and start a fresh session. Loses this
+        voice session's in-memory conversation — the alternative is a
+        client that answers nothing until someone restarts backtalk."""
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        await self.start()
+        self._dirty = False
+
     async def reset_turn(self, timeout: float = 8.0):
         """Re-align the message pipe after an interrupted/failed turn.
 
@@ -351,13 +377,7 @@ class WarmBrain:
             # rest of the day.
             log("[brain] stream desynced beyond repair — rebuilding the "
                 "session (conversation memory for this session resets)")
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            await self.start()
-            self._dirty = False
+            await self._rebuild()
 
     async def stop(self):
         if self._client:
@@ -417,6 +437,12 @@ class WarmBrain:
                         self._last_turn_failed = True
                         yielded = True
                         yield _limit_sentence(whole)
+                    elif _looks_like_overload(whole):
+                        log(f"[brain] server overload (assistant "
+                            f"message): {whole[:160]}")
+                        self._last_turn_failed = True
+                        yielded = True
+                        yield _overload_sentence()
                 elif t == "ResultMessage":
                     saw_result = True
                     self._dirty = False   # turn consumed — pipe aligned
@@ -426,7 +452,13 @@ class WarmBrain:
                     if not yielded:
                         detail = str(getattr(msg, "result", "")
                                      or getattr(msg, "subtype", "") or "")
-                        if _looks_like_limit(detail):
+                        if _looks_like_overload(detail):
+                            log(f"[brain] turn ended on server overload: "
+                                f"{detail[:160]}")
+                            self._last_turn_failed = True
+                            yielded = True
+                            yield _overload_sentence()
+                        elif _looks_like_limit(detail):
                             log(f"[brain] turn ended at usage limit: "
                                 f"{detail[:160]}")
                             self._last_turn_failed = True
@@ -444,6 +476,11 @@ class WarmBrain:
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except Exception as e:
+            if _looks_like_overload(repr(e)):
+                log(f"[brain] server overload: {str(e)[:200]}")
+                self._last_turn_failed = True
+                yield _overload_sentence()
+                return
             if _looks_like_limit(repr(e)):
                 log(f"[brain] usage limit reached: {str(e)[:200]}")
                 self._last_turn_failed = True
@@ -454,16 +491,29 @@ class WarmBrain:
         if tail:
             yield tail
         elif not yielded and not saw_result:
-            # The response stream exhausted with no ResultMessage and no
-            # text — the exact silent spin that reads as a hang and then
-            # drains as "0 stale messages" every turn after. Usually the
-            # plan hit its ceiling mid-turn.
-            log("[brain] turn produced no response and no result "
-                "message — likely usage limit")
+            # Stream exhausted with no ResultMessage and no text. A real
+            # usage-limit stop ALWAYS arrives as a ResultMessage or a lone
+            # AssistantMessage carrying the limit text (both handled
+            # above) — never as pure silence. So this is a dropped
+            # transport: the SDK's CLI subprocess has crashed or exited,
+            # and every turn after it drains as "0 stale messages" and
+            # comes back empty. Rebuild the session so the line self-heals
+            # instead of parroting "usage limit" until someone restarts
+            # backtalk. (This exact failure sent Master Pink chasing a
+            # phantom usage limit on 2026-09-05.)
+            log("[brain] empty turn, no result message — SDK session "
+                "dropped; rebuilding")
             self._last_turn_failed = True
-            yield ("That turn came back completely empty. I've most "
-                   "likely hit the Claude usage limit — check this "
-                   "window.")
+            try:
+                await self._rebuild()
+            except Exception as e:
+                log(f"[brain] rebuild after dropped session failed: "
+                    f"{str(e)[:160]}")
+                yield ("My session to the model dropped and I couldn't "
+                       "reconnect. Check this window.")
+                return
+            yield ("My session to the model dropped just then — I've "
+                   "reconnected. Ask me that again.")
 
 
 if __name__ == "__main__":
