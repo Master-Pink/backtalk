@@ -173,6 +173,10 @@ class WarmBrain:
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,
+                # Default is 1MB; a single chatty tool result (e.g. verbose
+                # ffmpeg stderr) can exceed that and kill the reader,
+                # dropping the whole session. 10MB gives real headroom.
+                max_buffer_size=10 * 1024 * 1024,
             )
         if resume:
             try:

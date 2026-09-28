@@ -55,6 +55,7 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 import asyncio
 import http.server
 import json
+import os
 import queue
 import re
 import shutil
@@ -181,6 +182,23 @@ def _start_tg_webhook(tg_q: "queue.Queue[str]"):
     log(f"[tgbridge] webhook listener up on 127.0.0.1:{_TG_WEBHOOK_PORT}")
 
 
+def _ngrok_config_path():
+    """The ngrok config file to hand ngrok explicitly. ngrok v3 does NOT
+    read the NGROK_CONFIG env var (only a --config flag), so we resolve
+    the path here and pass it on the command line. Order: $NGROK_CONFIG,
+    then agent_dir/.secrets/ngrok.yml (where this project keeps it), then
+    ngrok's own default location. Returns the first that exists, or ""."""
+    candidates = [
+        os.environ.get("NGROK_CONFIG", ""),
+        str(Path(CFG["agent_dir"]) / ".secrets" / "ngrok.yml"),
+        os.path.expandvars(r"%LOCALAPPDATA%\ngrok\ngrok.yml"),
+    ]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return c
+    return ""
+
+
 def _tg_ensure_ngrok():
     """Make sure ngrok's local admin API answers before registration
     tries to use it. Backtalk owns this now instead of assuming a
@@ -188,9 +206,11 @@ def _tg_ensure_ngrok():
     is what broke the live bridge on 2026-09-04: registration failed
     silently and nobody noticed until an inbound test came back dead.
     Launches ngrok detached so it keeps running independently of this
-    backtalk process, same as it was already doing before. Never
-    raises; a launch failure just means the registration call below
-    logs its own failure as it always has."""
+    backtalk process, same as it was already doing before. The --config
+    flag is required: without it ngrok starts unauthenticated and exits
+    (ERR_NGROK_4018), which is what left the bridge dead on 2026-09-06.
+    Never raises; a launch failure just means the registration call
+    below logs its own failure as it always has."""
     try:
         with urllib.request.urlopen(
                 "http://127.0.0.1:4040/api/tunnels", timeout=2):
@@ -201,17 +221,31 @@ def _tg_ensure_ngrok():
     if not ngrok_bin:
         log("[tgbridge] ngrok not on PATH — can't auto-start it")
         return False
+    argv = [ngrok_bin, "http", str(_TG_WEBHOOK_PORT)]
+    cfg = _ngrok_config_path()
+    if cfg:
+        argv += ["--config", cfg]
+    else:
+        log("[tgbridge] no ngrok config file found — ngrok will likely "
+            "fail to authenticate")
+    # Keep ngrok's own output where a later failure can be read, rather
+    # than /dev/null'ing the one thing that explains ERR_NGROK_* exits.
+    ngrok_log = Path(CFG["agent_dir"]) / ".secrets" / "ngrok-livebridge.log"
+    try:
+        logf = open(ngrok_log, "ab")
+    except Exception:
+        logf = subprocess.DEVNULL
     try:
         subprocess.Popen(
-            [ngrok_bin, "http", str(_TG_WEBHOOK_PORT)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            argv, stdout=logf, stderr=logf,
             creationflags=subprocess.DETACHED_PROCESS
             | subprocess.CREATE_NEW_PROCESS_GROUP)
-        log("[tgbridge] ngrok wasn't running — launched it")
+        log("[tgbridge] ngrok wasn't running — launched it"
+            + (f" (--config {cfg})" if cfg else ""))
     except Exception as e:
         log(f"[tgbridge] failed to launch ngrok: {e!r}")
         return False
-    for _ in range(8):
+    for _ in range(15):
         time.sleep(1)
         try:
             with urllib.request.urlopen(
@@ -219,7 +253,8 @@ def _tg_ensure_ngrok():
                 return True
         except Exception:
             continue
-    log("[tgbridge] ngrok didn't come up within 8s of launching it")
+    log("[tgbridge] ngrok didn't come up within 15s of launching it "
+        "— check .secrets/ngrok-livebridge.log")
     return False
 
 
@@ -227,10 +262,11 @@ def _tg_register_webhook():
     """Best-effort, once per launch, off the event loop: make sure
     ngrok is actually up (auto-launching it if it isn't), read its
     local admin API for the current public tunnel to the webhook port,
-    and register it with Telegram's setWebhook. No reserved ngrok
-    domain is in use (paid-plan only), so the public URL changes on
-    every ngrok restart — this call is what makes that self-healing on
-    the next backtalk launch instead of silently going stale. Retries
+    and register it with Telegram's setWebhook. The ngrok config carries
+    a free static domain, so the public URL is normally stable across
+    restarts — but re-registering every launch keeps the bridge
+    self-healing even if that ever changes or the webhook is cleared.
+    Retries
     a few times so a transient hiccup doesn't wait for the next
     restart to heal. Never raises; a missing ngrok binary or a
     persistent network problem just leaves inbound Telegram
@@ -603,6 +639,20 @@ _PASTE_OFF = "\x1b[201~"
 # swallow a paragraph into one "tag".
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
 
+# [name](url) markdown links get two different treatments depending on
+# audience: TTS only ever hears the name (a spoken URL is unbearable), while
+# the terminal gets the name wrapped in a real OSC-8 hyperlink so it's
+# clickable there without ever showing the literal address either.
+_MD_LINK = re.compile(r"\[([^\[\]]+)\]\((https?://[^\s()]+)\)")
+
+
+def _speech_text(raw: str) -> str:
+    return _MD_LINK.sub(lambda m: m.group(1), raw)
+
+
+def _terminal_text(raw: str) -> str:
+    return _MD_LINK.sub(lambda m: f"\x1b]8;;{m.group(2)}\x1b\\{m.group(1)}\x1b]8;;\x1b\\", raw)
+
 
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
@@ -797,19 +847,24 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if found:
             pending += [d.strip() for d in found if d.strip()]
         raw = _DIRECTION_TAG.sub(" ", raw)
-        # TTS hygiene: backticks and markdown fences are never speakable.
-        s = " ".join(raw.replace("`", "").split()).strip()
+        # TTS hygiene: backticks and markdown fences are never speakable;
+        # [name](url) links are stripped to just the name for speech, and
+        # separately turned into a real clickable OSC-8 link for the terminal
+        # (see _speech_text/_terminal_text) -- neither audience ever hears or
+        # sees the literal URL.
+        s = " ".join(_speech_text(raw).replace("`", "").split()).strip()
+        term_s = " ".join(_terminal_text(raw).replace("`", "").split()).strip()
         if not s:
             return
         _tg_send_async(s)   # mirror every spoken chunk to the live bridge
         if first:
-            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
+            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {term_s}"
                 + (f"  <directions: {pending}>" if pending else ""))
             mouth.say_chunk(s, pending)
             pending = []
             first = False
         else:
-            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
+            log(f"[{NAME}] {term_s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
                 mouth.say_chunk(" ".join(batch), pending)
